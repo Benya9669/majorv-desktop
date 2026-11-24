@@ -40,7 +40,7 @@ def main():
         desktop.attach(engine.rootObjects()[0])
         if args.demo and os.environ.get("MAJORV_SMOKE_TEST") == "1":
             # Let the packaged launcher render its first frame, then exit cleanly for CI.
-            QTimer.singleShot(500, app.quit)
+            QTimer.singleShot(500, desktop.quit)
         return app.exec()
     finally:
         desktop.close()

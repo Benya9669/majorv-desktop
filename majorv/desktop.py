@@ -4,7 +4,7 @@ import json
 import re
 import sys
 
-from PySide6.QtCore import QObject, Property, QSettings, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, Property, QSettings, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QActionGroup, QCursor, QDesktopServices, QWindow
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
@@ -76,7 +76,7 @@ class Desktop(QObject):
             action.triggered.connect(lambda checked=False, preset=key: self.panel.setValue("eq", preset))
             self._actions[key] = action
         self._menu.addSeparator()
-        self._menu.addAction("Выйти", QApplication.quit)
+        self._menu.addAction("Выйти", self.quit)
         # Qt 6.12's native Windows tray menu can crash when a submenu opens.
         # Keep the nested QMenu as a widget on Windows; Linux tray hosts use the exported menu.
         if sys.platform != "win32":
@@ -84,6 +84,7 @@ class Desktop(QObject):
         self._tray.activated.connect(self._activated)
         self._tray.messageClicked.connect(self._show)
         self._tray.show()
+        window.installEventFilter(self)
         window.visibilityChanged.connect(self._visibility)
         self._sync()
 
@@ -96,14 +97,33 @@ class Desktop(QObject):
 
     def _show(self):
         self._tray_watch.stop()
-        self._window.showNormal()
+        self._window.setWindowStates(self._window.windowStates() & ~Qt.WindowState.WindowMinimized)
+        self._window.show()
         self._window.raise_()
         self._window.requestActivate()
 
+    def _hide_to_tray(self):
+        if not self._tray.isVisible() or not QSystemTrayIcon.isSystemTrayAvailable():
+            return False
+        self._window.hide()
+        self._tray_watch.start()
+        return True
+
+    def eventFilter(self, watched, event):
+        if watched is self._window and event.type() == QEvent.Type.Close:
+            if not QApplication.instance().isSavingSession() and self._hide_to_tray():
+                event.ignore()
+                return True
+        return super().eventFilter(watched, event)
+
     def _visibility(self, visibility):
-        if visibility == QWindow.Visibility.Minimized and QSystemTrayIcon.isSystemTrayAvailable():
-            self._window.hide()
-            self._tray_watch.start()
+        if visibility == QWindow.Visibility.Minimized:
+            self._hide_to_tray()
+
+    @Slot()
+    def quit(self):
+        # The tray action ends the event loop directly, including when the window is hidden.
+        QApplication.exit(0)
 
     def _recover_window(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -186,5 +206,6 @@ class Desktop(QObject):
     def close(self):
         self._tray_watch.stop()
         if self._tray is not None:
+            self._window.removeEventFilter(self)
             self._tray.hide()
             self._menu.close()
