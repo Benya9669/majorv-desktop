@@ -47,6 +47,26 @@ EQ_SLOT_VALUES = {
     "2": bytes.fromhex("00 01"),
 }
 
+PROMPT_VALUES = {"off": b"\x00\x00", "on": b"\xff\xff"}
+
+SETTING_WRITES = {
+    "eq": (UUID_EQ_PRESET, EQ_PRESET_VALUES),
+    "m_button": (UUID_M_BUTTON, M_BUTTON_VALUES),
+    "prompts": (UUID_SOUND_PROMPTS, PROMPT_VALUES),
+}
+
+
+def setting_command(key: str, value: str) -> tuple[str, bytes]:
+    try:
+        uuid, choices = SETTING_WRITES[key]
+        return uuid, choices[value]
+    except KeyError as exc:
+        raise ValueError(f"Unknown setting or value: {key}={value}") from exc
+
+
+def matching_name(query: str, *names: str | None) -> str | None:
+    return next((name for name in names if name and query.casefold() in name.casefold()), None)
+
 
 def hex_bytes(value: bytes | bytearray) -> str:
     return bytes(value).hex(" ")
@@ -61,9 +81,9 @@ def decode_m_button(value: bytes | bytearray) -> str | None:
 
 def decode_sound_prompts(value: bytes | bytearray) -> str | None:
     data = bytes(value)
-    if data == bytes.fromhex("00 00"):
+    if data == PROMPT_VALUES["off"]:
         return "off"
-    if data == bytes.fromhex("ff ff"):
+    if data == PROMPT_VALUES["on"]:
         return "on"
     return None
 
@@ -78,14 +98,29 @@ def decode_power_timer(value: bytes | bytearray) -> str | None:
     return f"not-connected={seconds // 60}min (tail field)"
 
 
+def eq_preset_name(value: bytes | bytearray) -> str | None:
+    slots = eq_slots(value)
+    if slots:
+        return slots["eq"]
+    return EQ_PRESET_NAMES.get(value[-1]) if value else None
+
+
+def eq_slots(value: bytes | bytearray) -> dict[str, str | None]:
+    # The slot-switch notifications in frames 7245 and 7298 change byte 2.
+    if len(value) != 7 or value[:2] != b"\xff\x02" or value[2] > 1:
+        return {}
+    first, second = (EQ_PRESET_NAMES.get(preset) for preset in value[5:7])
+    return {
+        "eq": (first, second)[value[2]], "eq_active_slot": str(value[2] + 1),
+        "eq_slot1": first, "eq_slot2": second,
+    }
+
+
 def decode_eq_preset(value: bytes | bytearray) -> str | None:
-    data = bytes(value)
-    if not data:
-        return None
-    preset = EQ_PRESET_NAMES.get(data[-1])
+    preset = eq_preset_name(value)
     if preset is None:
         return None
-    return f"{preset} ({data[-1]})"
+    return f"{preset} ({EQ_PRESET_VALUES[preset][-1]})"
 
 
 def decode_status_blob(value: bytes | bytearray) -> str | None:
@@ -195,11 +230,13 @@ async def command_watch(ctx: CommandContext) -> None:
 
 
 async def command_m_button(ctx: CommandContext) -> None:
-    await write_value(ctx.client, UUID_M_BUTTON, "m-button", M_BUTTON_VALUES[ctx.args.value])
+    uuid, payload = setting_command("m_button", ctx.args.value)
+    await write_value(ctx.client, uuid, "m-button", payload)
 
 
 async def command_eq(ctx: CommandContext) -> None:
-    await write_value(ctx.client, UUID_EQ_PRESET, "eq-preset", EQ_PRESET_VALUES[ctx.args.preset])
+    uuid, payload = setting_command("eq", ctx.args.preset)
+    await write_value(ctx.client, uuid, "eq-preset", payload)
 
 
 async def command_eq_slot(ctx: CommandContext) -> None:
@@ -207,8 +244,8 @@ async def command_eq_slot(ctx: CommandContext) -> None:
 
 
 async def command_prompts(ctx: CommandContext) -> None:
-    value = bytes.fromhex("ff ff") if ctx.args.enabled else bytes.fromhex("00 00")
-    await write_value(ctx.client, UUID_SOUND_PROMPTS, "sound-prompts", value)
+    uuid, payload = setting_command("prompts", "on" if ctx.args.enabled else "off")
+    await write_value(ctx.client, uuid, "sound-prompts", payload)
 
 
 async def command_timer(ctx: CommandContext) -> None:
@@ -221,10 +258,9 @@ async def run(args: argparse.Namespace) -> None:
     if args.name:
         print(f"scanning for {args.name!r}...")
         device = await BleakScanner.find_device_by_filter(
-            lambda device, advertisement: (
-                args.name.lower() in (device.name or "").lower()
-                or args.name.lower() in (advertisement.local_name or "").lower()
-            ),
+            lambda device, advertisement: matching_name(
+                args.name, advertisement.local_name, device.name
+            ) is not None,
             timeout=args.scan_seconds,
         )
         if device is None:

@@ -1,0 +1,119 @@
+name: CI / Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          version="$(tr -d '\r\n' < VERSION)"
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          echo "number=$version" >> "$GITHUB_OUTPUT"
+      - name: Install system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y bluez tshark libegl1 libgl1 libfontconfig1 libgssapi-krb5-2 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0 libxkbcommon-x11-0
+      - run: python -m pip install -r requirements.txt pyinstaller==6.22.3
+      - run: python -m unittest discover -s tests -v
+      - run: python -m PyInstaller --noconfirm packaging/desktop.spec
+      - name: Build and smoke-test Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.number }}
+        run: |
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $compiler)) {
+            $setup = Join-Path $env:RUNNER_TEMP "innosetup-6.7.4.exe"
+            $toolDir = Join-Path $env:RUNNER_TEMP "inno"
+            Invoke-WebRequest https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe -OutFile $setup
+            if ((Get-FileHash $setup).Hash -ne 'A549929319F9120716677C685535CA4671E4B937B5FDC87E2585F32D8EB30E8C') { throw 'Unexpected Inno Setup checksum' }
+            $install = Start-Process $setup -ArgumentList "/PORTABLE=1 /CURRENTUSER /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOICONS /DIR=`"$toolDir`"" -WindowStyle Hidden -Wait -PassThru
+            if ($install.ExitCode) { exit $install.ExitCode }
+            $compiler = Join-Path $toolDir 'ISCC.exe'
+          }
+          & $compiler "/DAppVersion=$env:VERSION" packaging/windows.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $installer = Get-Item "dist/release/majorv-desktop-$env:VERSION-windows-x64.exe"
+          $target = Join-Path $env:RUNNER_TEMP "majorv-test-install"
+          $install = Start-Process $installer.FullName -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`"$target`"" -WindowStyle Hidden -PassThru -Wait
+          if ($install.ExitCode) { exit $install.ExitCode }
+          python packaging/smoke.py "$target"
+      - name: Build and smoke-test Linux package
+        if: runner.os == 'Linux'
+        run: |
+          bash packaging/debian.sh
+          sudo apt-get install -y ./dist/release/*.deb
+          python packaging/smoke.py /opt/majorv-desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: majorv-desktop-${{ matrix.os }}-${{ steps.version.outputs.number }}
+          path: dist/release/*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: majorv-desktop-*
+          path: dist/release
+          merge-multiple: true
+      - name: Publish a new version
+        working-directory: dist/release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(tr -d '\r\n' < ../../VERSION)"
+          tag="v$version"
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            echo "Tag $tag already exists."
+            exit 0
+          fi
+          files=("majorv-desktop-$version-windows-x64.exe" "majorv-desktop_${version}_amd64.deb")
+          sha256sum "${files[@]}" > SHA256SUMS
+          # A failed asset upload can leave a draft. Retry only our own target commit.
+          if state="$(gh release view "$tag" --json isDraft,targetCommitish)"; then
+            jq -e --arg sha "$GITHUB_SHA" '.isDraft and .targetCommitish == $sha' <<< "$state"
+          else
+            gh release create "$tag" --draft --target "$GITHUB_SHA" --title "$tag" --generate-notes
+          fi
+          gh release upload "$tag" "${files[@]}" SHA256SUMS --clobber
+          gh release edit "$tag" --draft=false
